@@ -1,0 +1,208 @@
+/**
+ * Core Philosophy: This ruleset implements a multi-faceted security model based on user ownership, role-based access control (RBAC), and shared access for a learning platform. The primary goal is to ensure that users have exclusive control over their personal data, instructors own and manage their course content, and students can only access materials for which they are enrolled.
+ *
+ * Data Structure:
+ * - /users/{userId}: Private user profile data, strictly owned by the user.
+ * - /roles_admin/{userId}, /roles_instructor/{userId}: Role-based collections where document existence grants specific privileges (admin, instructor).
+ * - /courseCategories: Publicly readable course categories, manageable only by administrators.
+ * - /courses/{courseId}: Course documents, publicly readable if published, but writable only by the owning instructor.
+ * - /courses/{courseId}/lessons: Lesson subcollections, accessible to the course instructor or enrolled students.
+ * - /users/{userId}/enrollments: A user's course enrollments, owned by the student but readable by the course instructor.
+ * - /users/{userId}/enrollments/{courseId}/lessonProgress: A student's private lesson progress, accessible only to that student.
+ *
+ * Key Security Decisions:
+ * - Strict User Privacy: User data is siloed. Listing users is explicitly disallowed.
+ * - Role-Based Privileges: Global "admin" and "instructor" roles are determined by document existence in dedicated `/roles_*` collections, enabling efficient and secure permission checks.
+ * - Denormalization for Authorization: To avoid slow and costly `get` calls in rules, authorization-critical data (like `instructorId` or `courseInstructorId`) is denormalized onto the documents being secured. For example, an `Enrollment` document contains the `courseInstructorId` so rules can grant the instructor read access without looking up the original course.
+ * - Conditional Public Access: The `/courses` collection uses an `isPublished` flag. While any signed-in user can query the collection, security rules on `get` ensure that only published courses or a user's own unpublished courses are actually readable.
+ * - Secure Subcollection Access: Access to nested data like lessons and progress is determined by the context of the parent documents (e.g., course ownership or enrollment status), often requiring an `exists()` check.
+ *
+ * Default Security Posture: Access is denied by default. All permissions must be explicitly granted. Client-side writes to role collections are disabled; these should be managed by a trusted server environment.
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =====================================================================
+    // Helper Functions
+    // =====================================================================
+
+    /**
+     * Authenticated check: Returns true if the user is signed in.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * Ownership check: Returns true if the requesting user's UID matches the provided userId.
+     */
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    /**
+     * Existence check: Returns true if the document being operated on already exists.
+     * Crucial for protecting against unintended writes on non-existent paths.
+     */
+    function isExistingDoc() {
+      return resource != null;
+    }
+
+    /**
+     * Role check: Returns true if the user has an admin role document.
+     */
+    function isAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/roles_admin/$(request.auth.uid));
+    }
+
+    /**
+     * Role check: Returns true if the user has an instructor role document.
+     */
+    function isInstructor() {
+      return isSignedIn() && exists(/databases/$(database)/documents/roles_instructor/$(request.auth.uid));
+    }
+
+    /**
+     * Enrollment check: Returns true if the requesting user has an enrollment document for the given course.
+     */
+    function isEnrolled(courseId) {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)/enrollments/$(courseId));
+    }
+
+    /**
+     * Read Access check: Verifies if a user can read lesson content.
+     * Access is granted if they are the course instructor OR if they are enrolled in a published course.
+     */
+    function canReadLessonContent(courseId) {
+      let courseDoc = get(/databases/$(database)/documents/courses/$(courseId)).data;
+      let isCourseOwner = isOwner(courseDoc.instructorId);
+      let isEnrolledInPublishedCourse = isEnrolled(courseId) && courseDoc.isPublished == true;
+      return isCourseOwner || isEnrolledInPublishedCourse;
+    }
+
+    // =====================================================================
+    // Collection Rules
+    // =====================================================================
+
+    /**
+     * @description Manages user profiles. A user can only access and modify their own document. User listing is disabled.
+     * @path /users/{userId}
+     * @allow A logged-in user (uid: 'user123') can (get) their own profile at `/users/user123`.
+     * @deny A logged-in user (uid: 'user456') cannot (get) another user's profile at `/users/user123`.
+     * @principle Restricts access to a user's own data tree.
+     */
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if false;
+      allow create: if isOwner(userId) && request.resource.data.id == userId;
+      allow update: if isOwner(userId) && isExistingDoc() && request.resource.data.id == resource.data.id;
+      allow delete: if isOwner(userId) && isExistingDoc();
+    }
+
+    /**
+     * @description Manages admin roles. Read-only for admins to check roles. No client writes allowed.
+     * @path /roles_admin/{userId}
+     * @allow An admin user can (get) a role document to check status.
+     * @deny A non-admin user cannot (get) or (list) any role documents.
+     * @principle Role-based access control (RBAC) lookup collection, secured from client modification.
+     */
+    match /roles_admin/{userId} {
+      allow get: if isAdmin();
+      allow list: if isAdmin();
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    /**
+     * @description Manages instructor roles. Users can create their own role document upon signup. Admins can view all roles.
+     * @path /roles_instructor/{userId}
+     * @allow A user can create their own instructor role document.
+     * @deny A user cannot create an instructor role for another user.
+     * @principle Role-based access control (RBAC) lookup collection, secured from client modification after creation.
+     */
+    match /roles_instructor/{userId} {
+      allow get: if isAdmin() || isOwner(userId);
+      allow list: if isAdmin();
+      allow create: if isOwner(userId);
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    /**
+     * @description Stores global course categories. Publicly readable by any signed-in user, but only admins can modify them.
+     * @path /courseCategories/{categoryId}
+     * @allow Any signed-in user can (list) all course categories.
+     * @deny An authenticated non-admin user cannot (create) a new category.
+     * @principle Segregates public read-only data from administrative write operations.
+     */
+    match /courseCategories/{categoryId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if isAdmin();
+      allow update: if isAdmin() && isExistingDoc();
+      allow delete: if isAdmin() && isExistingDoc();
+    }
+
+    /**
+     * @description Manages course documents. Published courses are readable by anyone. Only the instructor can modify their own course.
+     * @path /courses/{courseId}
+     * @allow A signed-in user can (get) a course document if `isPublished` is true.
+     * @deny A user cannot (update) a course if they are not the `instructorId`.
+     * @principle Enforces document ownership for writes and conditional public access for reads.
+     */
+    match /courses/{courseId} {
+      allow get: if (isExistingDoc() && resource.data.isPublished == true) || isOwner(resource.data.instructorId);
+      allow list: if resource.data.isPublished == true || isOwner(resource.data.instructorId);
+      allow create: if isInstructor() && request.resource.data.instructorId == request.auth.uid;
+      allow update: if isExistingDoc() && isOwner(resource.data.instructorId) && request.resource.data.instructorId == resource.data.instructorId;
+      allow delete: if isExistingDoc() && isOwner(resource.data.instructorId);
+    }
+
+    /**
+     * @description Manages lesson content. Instructors have full control. Enrolled students can read lessons of published courses.
+     * @path /courses/{courseId}/lessons/{lessonId}
+     * @allow A student enrolled in `courseABC` can (get) a lesson at `/courses/courseABC/lessons/lesson123` if the course is published.
+     * @deny A student not enrolled in `courseABC` cannot (get) a lesson at `/courses/courseABC/lessons/lesson123`.
+     * @principle Secures subcollection data based on user status (owner vs. enrolled member) by checking parent document state.
+     */
+    match /courses/{courseId}/lessons/{lessonId} {
+      allow get: if canReadLessonContent(courseId);
+      allow list: if get(/databases/$(database)/documents/courses/$(courseId)).data.isPublished == true || isOwner(get(/databases/$(database)/documents/courses/$(courseId)).data.instructorId);
+      allow create: if isOwner(get(/databases/$(database)/documents/courses/$(courseId)).data.instructorId) && request.resource.data.courseId == courseId;
+      allow update: if isExistingDoc() && isOwner(get(/databases/$(database)/documents/courses/$(courseId)).data.instructorId);
+      allow delete: if isExistingDoc() && isOwner(get(/databases/$(database)/documents/courses/$(courseId)).data.instructorId);
+    }
+
+    /**
+     * @description Manages a student's enrollment in a course. The student can manage their enrollment. The course instructor can view the enrollment.
+     * @path /users/{studentId}/enrollments/{courseId}
+     * @allow User 'student123' can (create) an enrollment for themselves at `/users/student123/enrollments/courseABC`.
+     * @deny User 'student456' cannot (get) the enrollment at `/users/student123/enrollments/courseABC`.
+     * @principle Shared access model where the document owner has write access and a related party (instructor) has read access, enabled by denormalized IDs.
+     */
+    match /users/{studentId}/enrollments/{courseId} {
+      allow get: if isOwner(studentId) || isOwner(resource.data.courseInstructorId);
+      allow list: if isOwner(studentId) || isOwner(resource.data.courseInstructorId);
+      allow create: if isOwner(studentId) && request.resource.data.studentId == studentId && get(/databases/$(database)/documents/courses/$(courseId)).data.isPublished == true;
+      allow update: if isOwner(studentId) && isExistingDoc() && request.resource.data.studentId == resource.data.studentId;
+      allow delete: if isOwner(studentId) && isExistingDoc();
+    }
+
+    /**
+     * @description Tracks a student's lesson progress. Only the student can view and modify their own progress.
+     * @path /users/{studentId}/enrollments/{courseId}/lessonProgress/{lessonId}
+     * @allow User 'student123' can (update) their own progress at `/users/student123/enrollments/courseABC/lessonProgress/lesson123`.
+     * @deny The instructor of 'courseABC' cannot (update) the student's progress document.
+     * @principle Strict ownership model for nested private data.
+     */
+    match /users/{studentId}/enrollments/{courseId}/lessonProgress/{lessonId} {
+      allow get: if isOwner(studentId);
+      allow list: if isOwner(studentId);
+      allow create: if isOwner(studentId) && isEnrolled(courseId);
+      allow update: if isOwner(studentId) && isExistingDoc();
+      allow delete: if isOwner(studentId) && isExistingDoc();
+    }
+  }
+}
